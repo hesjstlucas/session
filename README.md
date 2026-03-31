@@ -1,0 +1,55 @@
+# ERLC Session Bot
+
+A standalone Python Discord bot for simple ERLC session management.
+
+## Commands
+
+- `/ssu`
+- `/ssu vote_count:5`
+- `/ssu vote_count:5 ping:@everyone`
+- `/ssd`
+
+`/ssu` starts the session message in the channel where you run the command. The `vote_count` and `ping` options are optional, so `/ssu` by itself still works.
+
+## What it does
+
+- Sends a session start embed when `/ssu` is used
+- Updates the session message's member count every 30 seconds
+- Ends the session and edits the same embed when `/ssd` is used
+- Keeps one active session per Discord server
+- Persists the active session so updates can resume after a restart
+
+## Member Count
+
+This bot currently updates the Discord server member count, not the Roblox in-game ERLC player count.
+
+## Access
+
+Someone can use `/ssu` and `/ssd` if any one of these is true:
+
+- Their user ID is listed in `OWNER_USER_IDS`
+- They have a role listed in `SESSION_MANAGER_ROLE_IDS`
+- They already have the Discord `Manage Messages` permission
+
+## Setup
+
+1. Copy `.env.example` to `.env`.
+2. Fill in your bot token and any role or owner IDs you want to allow.
+3. Install dependencies:
+
+```bash
+py -m pip install -r requirements.txt
+```
+
+4. Start the bot:
+
+```bash
+py bot.py
+```
+
+## Notes
+
+- Enable the `Server Members Intent` for the bot in the Discord Developer Portal.
+- If `REGISTER_GUILD_ID` is set, slash commands sync to that server quickly.
+- The `ping` option accepts `@everyone`, `@here`, a role mention like `<@&123>`, or a raw role ID.
+- A [Procfile](/C:/Users/heher/Documents/Playground/erlc-session-bot/Procfile) is included so platforms like Railway can start the bot with `python bot.py`.
