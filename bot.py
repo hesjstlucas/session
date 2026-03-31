@@ -18,6 +18,10 @@ load_dotenv()
 
 PING_ROLE_RE = re.compile(r"^<@&(\d+)>$")
 DEFAULT_ERLC_API_BASE_URL = "https://api.policeroleplay.community/v1/server"
+FALLBACK_ERLC_API_BASE_URLS = (
+    "https://api.policeroleplay.community/v1/server",
+    "https://api.policeroleplay.community/v2/server",
+)
 ERLC_API_TIMEOUT_SECONDS = 10
 DEFAULT_HTTP_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -564,6 +568,29 @@ class ErlcSessionBot(commands.Bot):
         return await asyncio.to_thread(self._fetch_erlc_player_count_sync)
 
     def _fetch_erlc_player_count_sync(self) -> int:
+        candidate_urls: list[str] = []
+        configured_url = self.config.erlc_api_base_url.rstrip("/")
+        if configured_url:
+            candidate_urls.append(configured_url)
+        for fallback_url in FALLBACK_ERLC_API_BASE_URLS:
+            normalized = fallback_url.rstrip("/")
+            if normalized not in candidate_urls:
+                candidate_urls.append(normalized)
+
+        last_error: Optional[Exception] = None
+        for candidate_url in candidate_urls:
+            try:
+                return self._fetch_erlc_player_count_from_url(candidate_url)
+            except RuntimeError as error:
+                if "status 404" not in str(error):
+                    raise
+                last_error = error
+
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("No ERLC API URL was available.")
+
+    def _fetch_erlc_player_count_from_url(self, url: str) -> int:
         headers = {
             "Server-Key": self.config.erlc_server_key,
             "Accept": "application/json",
@@ -575,7 +602,7 @@ class ErlcSessionBot(commands.Bot):
             headers["Authorization"] = self.config.erlc_global_api_key
 
         request = urllib_request.Request(
-            self.config.erlc_api_base_url,
+            url,
             headers=headers,
             method="GET",
         )
