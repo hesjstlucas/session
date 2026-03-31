@@ -51,6 +51,7 @@ py bot.py
 
 - `ERLC_SERVER_KEY` comes from your ERLC private server settings and is required for live player counts.
 - `ERLC_GLOBAL_API_KEY` is optional. Leave it blank unless you were issued one by PRC.
+- `ERLC_HTTP_USER_AGENT` is optional. It lets you override the HTTP user-agent if your host gets blocked by an edge security check.
 - If `REGISTER_GUILD_ID` is set, slash commands sync to that server quickly.
 - The `ping` option accepts `@everyone`, `@here`, a role mention like `<@&123>`, or a raw role ID.
 - A [Procfile](/C:/Users/heher/Documents/Playground/erlc-session-bot/Procfile) is included so platforms like Railway can start the bot with `python bot.py`.

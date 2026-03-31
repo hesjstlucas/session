@@ -19,6 +19,11 @@ load_dotenv()
 PING_ROLE_RE = re.compile(r"^<@&(\d+)>$")
 DEFAULT_ERLC_API_BASE_URL = "https://api.policeroleplay.community/v1/server"
 ERLC_API_TIMEOUT_SECONDS = 10
+DEFAULT_HTTP_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/135.0.0.0 Safari/537.36"
+)
 SESSION_UPDATE_INTERVAL_SECONDS = 30
 
 
@@ -228,6 +233,7 @@ class BotConfig:
     erlc_api_base_url: str
     erlc_server_key: str
     erlc_global_api_key: Optional[str]
+    erlc_http_user_agent: str
     data_file_path: Path
 
     @classmethod
@@ -244,6 +250,9 @@ class BotConfig:
             erlc_api_base_url=api_base_url,
             erlc_server_key=require_env("ERLC_SERVER_KEY"),
             erlc_global_api_key=(os.getenv("ERLC_GLOBAL_API_KEY", "").strip() or None),
+            erlc_http_user_agent=(
+                os.getenv("ERLC_HTTP_USER_AGENT", "").strip() or DEFAULT_HTTP_USER_AGENT
+            ),
             data_file_path=Path(
                 os.getenv("DATA_FILE_PATH", "data/session-store.json").strip()
                 or "data/session-store.json"
@@ -558,6 +567,9 @@ class ErlcSessionBot(commands.Bot):
         headers = {
             "Server-Key": self.config.erlc_server_key,
             "Accept": "application/json",
+            "User-Agent": self.config.erlc_http_user_agent,
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
         }
         if self.config.erlc_global_api_key:
             headers["Authorization"] = self.config.erlc_global_api_key
