@@ -14,14 +14,14 @@ A standalone Python Discord bot for simple ERLC session management.
 ## What it does
 
 - Sends a session start embed when `/ssu` is used
-- Updates the session message's member count every 30 seconds
+- Updates the session message's ERLC player count every 30 seconds
 - Ends the session and edits the same embed when `/ssd` is used
 - Keeps one active session per Discord server
 - Persists the active session so updates can resume after a restart
 
-## Member Count
+## Player Count
 
-This bot currently updates the Discord server member count, not the Roblox in-game ERLC player count.
+This bot fetches the actual ERLC in-game player count from the public PRC Private Server API `GET /v1/server` response and displays that live value in the session embed.
 
 ## Access
 
@@ -34,7 +34,7 @@ Someone can use `/ssu` and `/ssd` if any one of these is true:
 ## Setup
 
 1. Copy `.env.example` to `.env`.
-2. Fill in your bot token and any role or owner IDs you want to allow.
+2. Fill in your bot token, your ERLC private server key, and any role or owner IDs you want to allow.
 3. Install dependencies:
 
 ```bash
@@ -49,7 +49,8 @@ py bot.py
 
 ## Notes
 
-- Enable the `Server Members Intent` for the bot in the Discord Developer Portal.
+- `ERLC_SERVER_KEY` comes from your ERLC private server settings and is required for live player counts.
+- `ERLC_GLOBAL_API_KEY` is optional. Leave it blank unless you were issued one by PRC.
 - If `REGISTER_GUILD_ID` is set, slash commands sync to that server quickly.
 - The `ping` option accepts `@everyone`, `@here`, a role mention like `<@&123>`, or a raw role ID.
 - A [Procfile](/C:/Users/heher/Documents/Playground/erlc-session-bot/Procfile) is included so platforms like Railway can start the bot with `python bot.py`.

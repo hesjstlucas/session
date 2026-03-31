@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import re
@@ -5,6 +6,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+from urllib import error as urllib_error
+from urllib import request as urllib_request
 
 import discord
 from discord import app_commands
@@ -14,6 +17,8 @@ from dotenv import load_dotenv
 load_dotenv()
 
 PING_ROLE_RE = re.compile(r"^<@&(\d+)>$")
+DEFAULT_ERLC_API_BASE_URL = "https://api.policeroleplay.community/v1/server"
+ERLC_API_TIMEOUT_SECONDS = 10
 SESSION_UPDATE_INTERVAL_SECONDS = 30
 
 
@@ -107,11 +112,53 @@ def allowed_mentions_for_ping(ping_text: Optional[str]) -> discord.AllowedMentio
     return discord.AllowedMentions.none()
 
 
-def format_member_count(guild: discord.Guild) -> str:
-    member_count = guild.member_count
-    if member_count is None:
-        member_count = len(guild.members)
-    return f"{member_count:,}"
+def format_player_count(session: dict) -> str:
+    player_count = session.get("player_count")
+    if isinstance(player_count, int) and not isinstance(player_count, bool):
+        return f"{player_count:,}"
+    return "Unavailable"
+
+
+def extract_api_error_code(payload: object) -> Optional[int]:
+    if isinstance(payload, dict):
+        direct = payload.get("code")
+        if isinstance(direct, int):
+            return direct
+        nested = payload.get("error")
+        if isinstance(nested, dict):
+            nested_code = nested.get("code")
+            if isinstance(nested_code, int):
+                return nested_code
+    return None
+
+
+def extract_api_error_message(payload: object) -> Optional[str]:
+    if isinstance(payload, dict):
+        for key in ("message", "Message", "error", "detail", "details"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+            if isinstance(value, dict):
+                nested_message = extract_api_error_message(value)
+                if nested_message:
+                    return nested_message
+    return None
+
+
+def parse_json_text(value: str) -> object:
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        return value
+
+
+def is_zero_player_error(status_code: int, payload: object, response_text: str) -> bool:
+    if extract_api_error_code(payload) == 3002:
+        return True
+
+    message = extract_api_error_message(payload) or response_text
+    lowered = message.lower()
+    return status_code == 422 and ("no players" in lowered or "offline" in lowered)
 
 
 def build_session_embed(
@@ -141,10 +188,15 @@ def build_session_embed(
         ),
         inline=True,
     )
-    embed.add_field(name="Member Count", value=format_member_count(guild), inline=True)
+    embed.add_field(name="ERLC Players", value=format_player_count(session), inline=True)
     embed.add_field(
         name="Started At",
         value=format_datetime_for_embed(session.get("started_at")),
+        inline=False,
+    )
+    embed.add_field(
+        name="Last Sync",
+        value=format_datetime_for_embed(session.get("player_count_updated_at")),
         inline=False,
     )
 
@@ -154,7 +206,7 @@ def build_session_embed(
 
     if active:
         embed.add_field(name="Status", value="Active", inline=True)
-        embed.set_footer(text=f"Member count refreshes every {SESSION_UPDATE_INTERVAL_SECONDS} seconds.")
+        embed.set_footer(text=f"ERLC player count refreshes every {SESSION_UPDATE_INTERVAL_SECONDS} seconds.")
     else:
         embed.add_field(name="Status", value="Ended", inline=True)
         if ended_by is not None:
@@ -173,15 +225,25 @@ class BotConfig:
     register_guild_id: Optional[int]
     owner_user_ids: set[int]
     session_manager_role_ids: set[int]
+    erlc_api_base_url: str
+    erlc_server_key: str
+    erlc_global_api_key: Optional[str]
     data_file_path: Path
 
     @classmethod
     def from_env(cls) -> "BotConfig":
+        api_base_url = os.getenv("ERLC_API_BASE_URL", DEFAULT_ERLC_API_BASE_URL).strip()
+        if not api_base_url:
+            api_base_url = DEFAULT_ERLC_API_BASE_URL
+
         return cls(
             token=require_env("DISCORD_TOKEN"),
             register_guild_id=parse_optional_id(os.getenv("REGISTER_GUILD_ID", "")),
             owner_user_ids=split_csv_ids(os.getenv("OWNER_USER_IDS", "")),
             session_manager_role_ids=split_csv_ids(os.getenv("SESSION_MANAGER_ROLE_IDS", "")),
+            erlc_api_base_url=api_base_url,
+            erlc_server_key=require_env("ERLC_SERVER_KEY"),
+            erlc_global_api_key=(os.getenv("ERLC_GLOBAL_API_KEY", "").strip() or None),
             data_file_path=Path(
                 os.getenv("DATA_FILE_PATH", "data/session-store.json").strip()
                 or "data/session-store.json"
@@ -324,6 +386,8 @@ class ErlcSessionBot(commands.Bot):
                 await self.send_ephemeral(interaction, "`vote_count` must be 0 or higher.")
                 return
 
+            await interaction.response.defer(ephemeral=True, thinking=True)
+
             existing_session = self.store.get_session(interaction.guild.id)
             if existing_session is not None:
                 _, error, removable = await self.get_session_message(existing_session)
@@ -343,6 +407,15 @@ class ErlcSessionBot(commands.Bot):
                 await self.send_ephemeral(interaction, ping_error)
                 return
 
+            try:
+                player_count = await self.fetch_erlc_player_count()
+            except Exception as error:
+                await self.send_ephemeral(
+                    interaction,
+                    f"Could not fetch the ERLC player count: {summarize_exception(error)}",
+                )
+                return
+
             session = {
                 "channel_id": int(channel.id),
                 "message_id": None,
@@ -351,6 +424,8 @@ class ErlcSessionBot(commands.Bot):
                 "started_at": utc_now_iso(),
                 "vote_count": vote_count,
                 "ping_text": ping_text,
+                "player_count": player_count,
+                "player_count_updated_at": utc_now_iso(),
             }
 
             embed = build_session_embed(interaction.guild, session, active=True)
@@ -371,7 +446,7 @@ class ErlcSessionBot(commands.Bot):
             self.store.set_session(interaction.guild.id, session)
             await self.send_ephemeral(
                 interaction,
-                f"Session started in {channel.mention}. The member count will refresh every 30 seconds.",
+                f"Session started in {channel.mention}. The ERLC player count will refresh every 30 seconds.",
             )
 
         @self.tree.command(name="ssd", description="End the active ERLC session announcement.")
@@ -381,6 +456,7 @@ class ErlcSessionBot(commands.Bot):
                 return
 
             assert interaction.guild is not None
+            await interaction.response.defer(ephemeral=True, thinking=True)
             session = self.store.get_session(interaction.guild.id)
             if session is None:
                 await self.send_ephemeral(interaction, "There is no active session in this server.")
@@ -475,6 +551,50 @@ class ErlcSessionBot(commands.Bot):
 
         return message, None, False
 
+    async def fetch_erlc_player_count(self) -> int:
+        return await asyncio.to_thread(self._fetch_erlc_player_count_sync)
+
+    def _fetch_erlc_player_count_sync(self) -> int:
+        headers = {
+            "Server-Key": self.config.erlc_server_key,
+            "Accept": "application/json",
+        }
+        if self.config.erlc_global_api_key:
+            headers["Authorization"] = self.config.erlc_global_api_key
+
+        request = urllib_request.Request(
+            self.config.erlc_api_base_url,
+            headers=headers,
+            method="GET",
+        )
+
+        try:
+            with urllib_request.urlopen(request, timeout=ERLC_API_TIMEOUT_SECONDS) as response:
+                payload = parse_json_text(response.read().decode("utf-8"))
+        except urllib_error.HTTPError as http_error:
+            response_text = http_error.read().decode("utf-8", errors="replace")
+            payload = parse_json_text(response_text)
+            if is_zero_player_error(http_error.code, payload, response_text):
+                return 0
+
+            message = extract_api_error_message(payload) or response_text.strip() or http_error.reason
+            raise RuntimeError(f"ERLC API request failed with status {http_error.code}: {message}")
+        except urllib_error.URLError as url_error:
+            raise RuntimeError(f"Could not reach the ERLC API: {url_error.reason}")
+
+        if not isinstance(payload, dict):
+            raise RuntimeError("ERLC API returned an unexpected response.")
+
+        current_players = payload.get("CurrentPlayers")
+        if isinstance(current_players, int) and not isinstance(current_players, bool):
+            return current_players
+
+        players = payload.get("Players")
+        if isinstance(players, list):
+            return len(players)
+
+        raise RuntimeError("ERLC API response did not include `CurrentPlayers`.")
+
     async def refresh_session_message(self, guild_id: int) -> None:
         session = self.store.get_session(guild_id)
         if session is None:
@@ -492,9 +612,20 @@ class ErlcSessionBot(commands.Bot):
                 print(f"Session refresh skipped for guild {guild_id}: {error}")
             return
 
+        try:
+            session["player_count"] = await self.fetch_erlc_player_count()
+            session["player_count_updated_at"] = utc_now_iso()
+        except Exception as error:
+            print(
+                f"Could not fetch ERLC player count for guild {guild_id}: "
+                f"{summarize_exception(error)}"
+            )
+            return
+
         embed = build_session_embed(guild, session, active=True)
         try:
             await message.edit(embed=embed)
+            self.store.set_session(guild_id, session)
         except discord.NotFound:
             self.store.remove_session(guild_id)
         except Exception as error:
