@@ -128,6 +128,38 @@ def format_player_count(session: dict) -> str:
     return "Unavailable"
 
 
+def get_base_vote_count(session: dict) -> int:
+    base_vote_count = session.get("base_vote_count")
+    if isinstance(base_vote_count, int) and not isinstance(base_vote_count, bool):
+        return max(base_vote_count, 0)
+
+    legacy_vote_count = session.get("vote_count")
+    if isinstance(legacy_vote_count, int) and not isinstance(legacy_vote_count, bool):
+        return max(legacy_vote_count, 0)
+
+    return 0
+
+
+def get_unique_voter_ids(session: dict) -> list[str]:
+    raw_voter_ids = session.get("voter_ids")
+    if not isinstance(raw_voter_ids, list):
+        return []
+
+    seen: set[str] = set()
+    unique_voter_ids: list[str] = []
+    for voter_id in raw_voter_ids:
+        text = str(voter_id).strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        unique_voter_ids.append(text)
+    return unique_voter_ids
+
+
+def get_total_vote_count(session: dict) -> int:
+    return get_base_vote_count(session) + len(get_unique_voter_ids(session))
+
+
 def extract_api_error_code(payload: object) -> Optional[int]:
     if isinstance(payload, dict):
         direct = payload.get("code")
@@ -190,11 +222,7 @@ def build_session_embed(
     embed.add_field(name="Started By", value=f"<@{session['started_by_id']}>", inline=True)
     embed.add_field(
         name="Vote Count",
-        value=(
-            str(session["vote_count"])
-            if session.get("vote_count") is not None
-            else "Not provided"
-        ),
+        value=str(get_total_vote_count(session)),
         inline=True,
     )
     embed.add_field(name="ERLC Players", value=format_player_count(session), inline=True)
@@ -234,6 +262,7 @@ class BotConfig:
     register_guild_id: Optional[int]
     owner_user_ids: set[int]
     session_manager_role_ids: set[int]
+    session_channel_id: Optional[int]
     erlc_api_base_url: str
     erlc_server_key: str
     erlc_global_api_key: Optional[str]
@@ -251,6 +280,7 @@ class BotConfig:
             register_guild_id=parse_optional_id(os.getenv("REGISTER_GUILD_ID", "")),
             owner_user_ids=split_csv_ids(os.getenv("OWNER_USER_IDS", "")),
             session_manager_role_ids=split_csv_ids(os.getenv("SESSION_MANAGER_ROLE_IDS", "")),
+            session_channel_id=parse_optional_id(os.getenv("SESSION_CHANNEL_ID", "")),
             erlc_api_base_url=api_base_url,
             erlc_server_key=require_env("ERLC_SERVER_KEY"),
             erlc_global_api_key=(os.getenv("ERLC_GLOBAL_API_KEY", "").strip() or None),
@@ -311,6 +341,86 @@ class SessionStore:
         return removed
 
 
+class SessionVoteView(discord.ui.View):
+    def __init__(
+        self,
+        bot: "ErlcSessionBot",
+        guild_id: int,
+        session: Optional[dict],
+        *,
+        disabled: bool = False,
+    ) -> None:
+        super().__init__(timeout=None)
+        self.bot = bot
+        self.guild_id = guild_id
+
+        vote_button = discord.ui.Button(
+            label=f"Vote ({get_total_vote_count(session or {})})",
+            style=discord.ButtonStyle.primary,
+            custom_id=f"session:vote:{guild_id}",
+            disabled=disabled,
+        )
+        vote_button.callback = self.vote_callback
+        self.add_item(vote_button)
+
+    async def vote_callback(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None:
+            await interaction.response.send_message(
+                "This vote button can only be used in a server.",
+                ephemeral=True,
+            )
+            return
+
+        message = interaction.message
+        if message is None:
+            await interaction.response.send_message(
+                "Could not locate the session message for that vote.",
+                ephemeral=True,
+            )
+            return
+
+        session = self.bot.store.get_session(self.guild_id)
+        if session is None or session.get("message_id") != message.id:
+            try:
+                await message.edit(view=None)
+            except Exception:
+                pass
+            await interaction.response.send_message(
+                "That session is no longer active.",
+                ephemeral=True,
+            )
+            return
+
+        voter_ids = get_unique_voter_ids(session)
+        user_id = str(interaction.user.id)
+        if user_id in voter_ids:
+            voter_ids.remove(user_id)
+            action_text = "removed your vote"
+        else:
+            voter_ids.append(user_id)
+            action_text = "counted your vote"
+
+        session["voter_ids"] = voter_ids
+        guild = interaction.guild
+        embed = build_session_embed(guild, session, active=True)
+        view = SessionVoteView(self.bot, self.guild_id, session)
+
+        try:
+            await interaction.response.edit_message(embed=embed, view=view)
+        except Exception as error:
+            await interaction.response.send_message(
+                f"Could not update the vote: {summarize_exception(error)}",
+                ephemeral=True,
+            )
+            return
+
+        self.bot.store.set_session(self.guild_id, session)
+        await interaction.followup.send(
+            f"You {action_text}. Total votes: {get_total_vote_count(session)}.",
+            ephemeral=True,
+        )
+
+
 class ErlcSessionBot(commands.Bot):
     def __init__(self, config: BotConfig, store: SessionStore) -> None:
         intents = discord.Intents.none()
@@ -339,6 +449,9 @@ class ErlcSessionBot(commands.Bot):
 
         if not self.session_updater.is_running():
             self.session_updater.start()
+
+        for session in self.store.list_sessions():
+            self.add_view(SessionVoteView(self, session["guild_id"], session))
 
     async def close(self) -> None:
         if self.session_updater.is_running():
@@ -378,7 +491,7 @@ class ErlcSessionBot(commands.Bot):
         @self.tree.command(name="ssu", description="Start an ERLC session announcement.")
         @app_commands.guild_only()
         @app_commands.describe(
-            vote_count="Optional vote count for the session",
+            vote_count="Optional starting vote count before button votes",
             ping="Optional ping: @everyone, @here, role mention, or role ID",
         )
         async def ssu(
@@ -390,9 +503,9 @@ class ErlcSessionBot(commands.Bot):
                 return
 
             assert interaction.guild is not None
-            channel = interaction.channel
-            if channel is None or not hasattr(channel, "send") or not hasattr(channel, "id"):
-                await self.send_ephemeral(interaction, "This channel cannot be used for session announcements.")
+            target_channel, channel_error = await self.get_session_channel(interaction)
+            if target_channel is None:
+                await self.send_ephemeral(interaction, channel_error or "The session channel is unavailable.")
                 return
 
             if vote_count is not None and vote_count < 0:
@@ -430,12 +543,13 @@ class ErlcSessionBot(commands.Bot):
                 return
 
             session = {
-                "channel_id": int(channel.id),
+                "channel_id": int(target_channel.id),
                 "message_id": None,
                 "started_by_id": str(interaction.user.id),
                 "started_by_tag": str(interaction.user),
                 "started_at": utc_now_iso(),
-                "vote_count": vote_count,
+                "base_vote_count": vote_count or 0,
+                "voter_ids": [],
                 "ping_text": ping_text,
                 "player_count": player_count,
                 "player_count_updated_at": utc_now_iso(),
@@ -443,9 +557,10 @@ class ErlcSessionBot(commands.Bot):
 
             embed = build_session_embed(interaction.guild, session, active=True)
             try:
-                message = await channel.send(
+                message = await target_channel.send(
                     content=ping_text or None,
                     embed=embed,
+                    view=SessionVoteView(self, interaction.guild.id, session),
                     allowed_mentions=allowed_mentions_for_ping(ping_text),
                 )
             except Exception as error:
@@ -459,7 +574,10 @@ class ErlcSessionBot(commands.Bot):
             self.store.set_session(interaction.guild.id, session)
             await self.send_ephemeral(
                 interaction,
-                f"Session started in {channel.mention}. The ERLC player count will refresh every 30 seconds.",
+                (
+                    f"Session started in {target_channel.mention}. "
+                    f"The ERLC player count will refresh every 30 seconds."
+                ),
             )
 
         @self.tree.command(name="ssd", description="End the active ERLC session announcement.")
@@ -498,7 +616,7 @@ class ErlcSessionBot(commands.Bot):
                 ended_by=interaction.user,
             )
             try:
-                await message.edit(embed=embed)
+                await message.edit(embed=embed, view=None)
             except Exception as edit_error:
                 await self.send_ephemeral(
                     interaction,
@@ -534,6 +652,32 @@ class ErlcSessionBot(commands.Bot):
             await interaction.edit_original_response(content=message)
         else:
             await interaction.response.send_message(message, ephemeral=True)
+
+    async def get_session_channel(
+        self, interaction: discord.Interaction
+    ) -> tuple[Optional[discord.abc.Messageable], Optional[str]]:
+        if self.config.session_channel_id is None:
+            channel = interaction.channel
+            if channel is None or not hasattr(channel, "send") or not hasattr(channel, "id"):
+                return None, "This channel cannot be used for session announcements."
+            return channel, None
+
+        channel = self.get_channel(self.config.session_channel_id)
+        if channel is None:
+            try:
+                channel = await self.fetch_channel(self.config.session_channel_id)
+            except discord.NotFound:
+                return None, "Configured `SESSION_CHANNEL_ID` channel was not found."
+            except Exception as error:
+                return None, f"Could not load the configured session channel: {summarize_exception(error)}"
+
+        if not hasattr(channel, "send") or not hasattr(channel, "id") or not hasattr(channel, "mention"):
+            return None, "Configured `SESSION_CHANNEL_ID` channel is not messageable."
+
+        if hasattr(channel, "guild") and getattr(channel.guild, "id", None) != interaction.guild_id:
+            return None, "Configured `SESSION_CHANNEL_ID` must be a channel in this same server."
+
+        return channel, None
 
     async def get_session_message(
         self, session: dict
@@ -663,7 +807,7 @@ class ErlcSessionBot(commands.Bot):
 
         embed = build_session_embed(guild, session, active=True)
         try:
-            await message.edit(embed=embed)
+            await message.edit(embed=embed, view=SessionVoteView(self, guild_id, session))
             self.store.set_session(guild_id, session)
         except discord.NotFound:
             self.store.remove_session(guild_id)
