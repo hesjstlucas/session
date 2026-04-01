@@ -128,6 +128,21 @@ def format_player_count(session: dict) -> str:
     return "Unavailable"
 
 
+def get_session_status(session: dict) -> str:
+    status = str(session.get("status", "")).strip().lower()
+    if status in {"pending", "active", "ended"}:
+        return status
+    return "active"
+
+
+def is_session_pending(session: dict) -> bool:
+    return get_session_status(session) == "pending"
+
+
+def is_session_active(session: dict) -> bool:
+    return get_session_status(session) == "active"
+
+
 def get_required_vote_count(session: dict) -> int:
     required_vote_count = session.get("required_vote_count")
     if isinstance(required_vote_count, int) and not isinstance(required_vote_count, bool):
@@ -170,6 +185,11 @@ def format_vote_progress(session: dict) -> str:
     if required_vote_count > 0:
         return f"{total_vote_count}/{required_vote_count}"
     return str(total_vote_count)
+
+
+def has_reached_vote_goal(session: dict) -> bool:
+    required_vote_count = get_required_vote_count(session)
+    return required_vote_count > 0 and get_total_vote_count(session) >= required_vote_count
 
 
 def extract_api_error_code(payload: object) -> Optional[int]:
@@ -218,36 +238,56 @@ def build_session_embed(
     guild: discord.Guild,
     session: dict,
     *,
-    active: bool,
+    state: str,
     ended_by: Optional[discord.abc.User] = None,
 ) -> discord.Embed:
+    title_map = {
+        "pending": "ERLC Session Vote",
+        "active": "ERLC Session Started",
+        "ended": "ERLC Session Ended",
+    }
+    description_map = {
+        "pending": "Players can vote below. The session starts automatically when the goal is reached.",
+        "active": "A new ERLC session is now active.",
+        "ended": "The ERLC session has been ended.",
+    }
+    color_map = {
+        "pending": discord.Color.gold(),
+        "active": discord.Color.green(),
+        "ended": discord.Color.red(),
+    }
+
     embed = discord.Embed(
-        title="ERLC Session Started" if active else "ERLC Session Ended",
-        description=(
-            "A new ERLC session is now active."
-            if active
-            else "The ERLC session has been ended."
-        ),
-        color=discord.Color.green() if active else discord.Color.red(),
+        title=title_map.get(state, "ERLC Session"),
+        description=description_map.get(state, "ERLC session update."),
+        color=color_map.get(state, discord.Color.blurple()),
         timestamp=datetime.now(timezone.utc),
     )
-    embed.add_field(name="Started By", value=f"<@{session['started_by_id']}>", inline=True)
+    embed.add_field(name="Host", value=f"<@{session['started_by_id']}>", inline=True)
     embed.add_field(
         name="Votes",
         value=format_vote_progress(session),
         inline=True,
     )
     embed.add_field(name="ERLC Players", value=format_player_count(session), inline=True)
-    embed.add_field(
-        name="Started At",
-        value=format_datetime_for_embed(session.get("started_at")),
-        inline=False,
-    )
-    embed.add_field(
-        name="Last Sync",
-        value=format_datetime_for_embed(session.get("player_count_updated_at")),
-        inline=False,
-    )
+
+    if state == "pending":
+        embed.add_field(
+            name="Vote Created At",
+            value=format_datetime_for_embed(session.get("created_at")),
+            inline=False,
+        )
+    else:
+        embed.add_field(
+            name="Started At",
+            value=format_datetime_for_embed(session.get("started_at")),
+            inline=False,
+        )
+        embed.add_field(
+            name="Last Sync",
+            value=format_datetime_for_embed(session.get("player_count_updated_at")),
+            inline=False,
+        )
 
     ping_text = session.get("ping_text")
     if ping_text:
@@ -255,10 +295,13 @@ def build_session_embed(
 
     required_vote_count = get_required_vote_count(session)
     if required_vote_count > 0:
-        vote_goal_value = "Reached" if get_total_vote_count(session) >= required_vote_count else "Waiting"
-        embed.add_field(name="Vote Goal", value=vote_goal_value, inline=True)
+        vote_goal_value = "Reached" if has_reached_vote_goal(session) else "Waiting"
+        embed.add_field(name="Vote Goal", value=f"{vote_goal_value} ({required_vote_count})", inline=True)
 
-    if active:
+    if state == "pending":
+        embed.add_field(name="Status", value="Voting", inline=True)
+        embed.set_footer(text="Click the vote button below. The session starts when the goal is reached.")
+    elif state == "active":
         embed.add_field(name="Status", value="Active", inline=True)
         embed.set_footer(text=f"ERLC player count refreshes every {SESSION_UPDATE_INTERVAL_SECONDS} seconds.")
     else:
@@ -408,6 +451,17 @@ class SessionVoteView(discord.ui.View):
             )
             return
 
+        if not is_session_pending(session):
+            try:
+                await message.edit(view=None)
+            except Exception:
+                pass
+            await interaction.response.send_message(
+                "Voting is closed because the session has already started.",
+                ephemeral=True,
+            )
+            return
+
         voter_ids = get_unique_voter_ids(session)
         user_id = str(interaction.user.id)
         if user_id in voter_ids:
@@ -419,11 +473,38 @@ class SessionVoteView(discord.ui.View):
 
         session["voter_ids"] = voter_ids
         guild = interaction.guild
-        embed = build_session_embed(guild, session, active=True)
-        view = SessionVoteView(self.bot, self.guild_id, session)
+        started_now = False
+        player_count_notice: Optional[str] = None
+
+        if has_reached_vote_goal(session):
+            session["status"] = "active"
+            session["started_at"] = utc_now_iso()
+            started_now = True
+            try:
+                session["player_count"] = await self.bot.fetch_erlc_player_count()
+                session["player_count_updated_at"] = utc_now_iso()
+            except Exception as error:
+                session["player_count"] = None
+                session["player_count_updated_at"] = None
+                player_count_notice = summarize_exception(error)
+
+        state = get_session_status(session)
+        embed = build_session_embed(guild, session, state=state)
+        view = None if started_now else SessionVoteView(self.bot, self.guild_id, session)
+        content = session.get("ping_text") if started_now else None
+        allowed_mentions = (
+            allowed_mentions_for_ping(session.get("ping_text"))
+            if started_now
+            else discord.AllowedMentions.none()
+        )
 
         try:
-            await interaction.response.edit_message(embed=embed, view=view)
+            await interaction.response.edit_message(
+                content=content,
+                embed=embed,
+                view=view,
+                allowed_mentions=allowed_mentions,
+            )
         except Exception as error:
             await interaction.response.send_message(
                 f"Could not update the vote: {summarize_exception(error)}",
@@ -432,6 +513,15 @@ class SessionVoteView(discord.ui.View):
             return
 
         self.bot.store.set_session(self.guild_id, session)
+        if started_now:
+            message_text = (
+                f"You {action_text}. Vote goal reached, so the session has started."
+            )
+            if player_count_notice:
+                message_text += f" ERLC player count could not be refreshed right away: {player_count_notice}"
+            await interaction.followup.send(message_text, ephemeral=True)
+            return
+
         await interaction.followup.send(
             f"You {action_text}. Votes: {format_vote_progress(session)}.",
             ephemeral=True,
@@ -468,7 +558,8 @@ class ErlcSessionBot(commands.Bot):
             self.session_updater.start()
 
         for session in self.store.list_sessions():
-            self.add_view(SessionVoteView(self, session["guild_id"], session))
+            if is_session_pending(session):
+                self.add_view(SessionVoteView(self, session["guild_id"], session))
 
     async def close(self) -> None:
         if self.session_updater.is_running():
@@ -492,6 +583,8 @@ class ErlcSessionBot(commands.Bot):
     @tasks.loop(seconds=SESSION_UPDATE_INTERVAL_SECONDS)
     async def session_updater(self) -> None:
         for session in self.store.list_sessions():
+            if not is_session_active(session):
+                continue
             try:
                 await self.refresh_session_message(session["guild_id"])
             except Exception as error:
@@ -550,35 +643,55 @@ class ErlcSessionBot(commands.Bot):
                 await self.send_ephemeral(interaction, ping_error)
                 return
 
-            try:
-                player_count = await self.fetch_erlc_player_count()
-            except Exception as error:
-                await self.send_ephemeral(
-                    interaction,
-                    f"Could not fetch the ERLC player count: {summarize_exception(error)}",
-                )
-                return
+            starts_immediately = (count or 0) <= 0
+            player_count: Optional[int] = None
+            player_count_updated_at: Optional[str] = None
+
+            if starts_immediately:
+                try:
+                    player_count = await self.fetch_erlc_player_count()
+                    player_count_updated_at = utc_now_iso()
+                except Exception as error:
+                    await self.send_ephemeral(
+                        interaction,
+                        f"Could not fetch the ERLC player count: {summarize_exception(error)}",
+                    )
+                    return
 
             session = {
                 "channel_id": int(target_channel.id),
                 "message_id": None,
                 "started_by_id": str(interaction.user.id),
                 "started_by_tag": str(interaction.user),
-                "started_at": utc_now_iso(),
+                "status": "active" if starts_immediately else "pending",
+                "created_at": utc_now_iso(),
+                "started_at": utc_now_iso() if starts_immediately else None,
                 "required_vote_count": count or 0,
                 "voter_ids": [],
                 "ping_text": ping_text,
                 "player_count": player_count,
-                "player_count_updated_at": utc_now_iso(),
+                "player_count_updated_at": player_count_updated_at,
             }
 
-            embed = build_session_embed(interaction.guild, session, active=True)
+            embed = build_session_embed(
+                interaction.guild,
+                session,
+                state=get_session_status(session),
+            )
             try:
                 message = await target_channel.send(
-                    content=ping_text or None,
+                    content=ping_text if starts_immediately else None,
                     embed=embed,
-                    view=SessionVoteView(self, interaction.guild.id, session),
-                    allowed_mentions=allowed_mentions_for_ping(ping_text),
+                    view=(
+                        None
+                        if starts_immediately
+                        else SessionVoteView(self, interaction.guild.id, session)
+                    ),
+                    allowed_mentions=(
+                        allowed_mentions_for_ping(ping_text)
+                        if starts_immediately
+                        else discord.AllowedMentions.none()
+                    ),
                 )
             except Exception as error:
                 await self.send_ephemeral(
@@ -589,13 +702,22 @@ class ErlcSessionBot(commands.Bot):
 
             session["message_id"] = message.id
             self.store.set_session(interaction.guild.id, session)
-            await self.send_ephemeral(
-                interaction,
-                (
-                    f"Session started in {target_channel.mention}. "
-                    f"The ERLC player count will refresh every 30 seconds."
-                ),
-            )
+            if starts_immediately:
+                await self.send_ephemeral(
+                    interaction,
+                    (
+                        f"Session started in {target_channel.mention}. "
+                        f"The ERLC player count will refresh every 30 seconds."
+                    ),
+                )
+            else:
+                await self.send_ephemeral(
+                    interaction,
+                    (
+                        f"Session vote started in {target_channel.mention}. "
+                        f"The session will auto-start when the vote reaches {format_vote_progress(session)}."
+                    ),
+                )
 
         @self.tree.command(name="ssd", description="End the active ERLC session announcement.")
         @app_commands.guild_only()
@@ -629,11 +751,11 @@ class ErlcSessionBot(commands.Bot):
             embed = build_session_embed(
                 interaction.guild,
                 session,
-                active=False,
+                state="ended",
                 ended_by=interaction.user,
             )
             try:
-                await message.edit(embed=embed, view=None)
+                await message.edit(content=None, embed=embed, view=None)
             except Exception as edit_error:
                 await self.send_ephemeral(
                     interaction,
@@ -800,6 +922,9 @@ class ErlcSessionBot(commands.Bot):
         if session is None:
             return
 
+        if not is_session_active(session):
+            return
+
         guild = self.get_guild(guild_id)
         if guild is None:
             return
@@ -822,9 +947,14 @@ class ErlcSessionBot(commands.Bot):
             )
             return
 
-        embed = build_session_embed(guild, session, active=True)
+        embed = build_session_embed(guild, session, state="active")
         try:
-            await message.edit(embed=embed, view=SessionVoteView(self, guild_id, session))
+            await message.edit(
+                content=session.get("ping_text") or None,
+                embed=embed,
+                view=None,
+                allowed_mentions=allowed_mentions_for_ping(session.get("ping_text")),
+            )
             self.store.set_session(guild_id, session)
         except discord.NotFound:
             self.store.remove_session(guild_id)
