@@ -128,10 +128,14 @@ def format_player_count(session: dict) -> str:
     return "Unavailable"
 
 
-def get_base_vote_count(session: dict) -> int:
-    base_vote_count = session.get("base_vote_count")
-    if isinstance(base_vote_count, int) and not isinstance(base_vote_count, bool):
-        return max(base_vote_count, 0)
+def get_required_vote_count(session: dict) -> int:
+    required_vote_count = session.get("required_vote_count")
+    if isinstance(required_vote_count, int) and not isinstance(required_vote_count, bool):
+        return max(required_vote_count, 0)
+
+    legacy_base_vote_count = session.get("base_vote_count")
+    if isinstance(legacy_base_vote_count, int) and not isinstance(legacy_base_vote_count, bool):
+        return max(legacy_base_vote_count, 0)
 
     legacy_vote_count = session.get("vote_count")
     if isinstance(legacy_vote_count, int) and not isinstance(legacy_vote_count, bool):
@@ -157,7 +161,15 @@ def get_unique_voter_ids(session: dict) -> list[str]:
 
 
 def get_total_vote_count(session: dict) -> int:
-    return get_base_vote_count(session) + len(get_unique_voter_ids(session))
+    return len(get_unique_voter_ids(session))
+
+
+def format_vote_progress(session: dict) -> str:
+    total_vote_count = get_total_vote_count(session)
+    required_vote_count = get_required_vote_count(session)
+    if required_vote_count > 0:
+        return f"{total_vote_count}/{required_vote_count}"
+    return str(total_vote_count)
 
 
 def extract_api_error_code(payload: object) -> Optional[int]:
@@ -221,8 +233,8 @@ def build_session_embed(
     )
     embed.add_field(name="Started By", value=f"<@{session['started_by_id']}>", inline=True)
     embed.add_field(
-        name="Vote Count",
-        value=str(get_total_vote_count(session)),
+        name="Votes",
+        value=format_vote_progress(session),
         inline=True,
     )
     embed.add_field(name="ERLC Players", value=format_player_count(session), inline=True)
@@ -240,6 +252,11 @@ def build_session_embed(
     ping_text = session.get("ping_text")
     if ping_text:
         embed.add_field(name="Ping", value=ping_text, inline=True)
+
+    required_vote_count = get_required_vote_count(session)
+    if required_vote_count > 0:
+        vote_goal_value = "Reached" if get_total_vote_count(session) >= required_vote_count else "Waiting"
+        embed.add_field(name="Vote Goal", value=vote_goal_value, inline=True)
 
     if active:
         embed.add_field(name="Status", value="Active", inline=True)
@@ -355,7 +372,7 @@ class SessionVoteView(discord.ui.View):
         self.guild_id = guild_id
 
         vote_button = discord.ui.Button(
-            label=f"Vote ({get_total_vote_count(session or {})})",
+            label=f"Vote ({format_vote_progress(session or {})})",
             style=discord.ButtonStyle.primary,
             custom_id=f"session:vote:{guild_id}",
             disabled=disabled,
@@ -416,7 +433,7 @@ class SessionVoteView(discord.ui.View):
 
         self.bot.store.set_session(self.guild_id, session)
         await interaction.followup.send(
-            f"You {action_text}. Total votes: {get_total_vote_count(session)}.",
+            f"You {action_text}. Votes: {format_vote_progress(session)}.",
             ephemeral=True,
         )
 
@@ -491,12 +508,12 @@ class ErlcSessionBot(commands.Bot):
         @self.tree.command(name="ssu", description="Start an ERLC session announcement.")
         @app_commands.guild_only()
         @app_commands.describe(
-            vote_count="Optional starting vote count before button votes",
+            count="Optional vote goal players need to reach by clicking the button",
             ping="Optional ping: @everyone, @here, role mention, or role ID",
         )
         async def ssu(
             interaction: discord.Interaction,
-            vote_count: Optional[int] = None,
+            count: Optional[int] = None,
             ping: Optional[str] = None,
         ) -> None:
             if not await self.ensure_access(interaction):
@@ -508,8 +525,8 @@ class ErlcSessionBot(commands.Bot):
                 await self.send_ephemeral(interaction, channel_error or "The session channel is unavailable.")
                 return
 
-            if vote_count is not None and vote_count < 0:
-                await self.send_ephemeral(interaction, "`vote_count` must be 0 or higher.")
+            if count is not None and count < 1:
+                await self.send_ephemeral(interaction, "`count` must be 1 or higher.")
                 return
 
             await interaction.response.defer(ephemeral=True, thinking=True)
@@ -548,7 +565,7 @@ class ErlcSessionBot(commands.Bot):
                 "started_by_id": str(interaction.user.id),
                 "started_by_tag": str(interaction.user),
                 "started_at": utc_now_iso(),
-                "base_vote_count": vote_count or 0,
+                "required_vote_count": count or 0,
                 "voter_ids": [],
                 "ping_text": ping_text,
                 "player_count": player_count,
