@@ -9,7 +9,7 @@ A standalone Python Discord bot for simple ERLC session management.
 - `/ssu count:5 ping:@everyone`
 - `/ssd`
 
-`/ssu` posts a vote message in your configured session channel. `count` is an optional vote goal, so `/ssu count:5` starts the vote at `0/5`, and once players click the button enough times, that same message turns into the live session start message.
+`/ssu` posts a vote message in your configured session channel. `count` is the vote goal, so `/ssu count:5` starts the vote at `0/5`, and once players click the button enough times, that same message turns into the live session start message.
 
 ## What it does
 

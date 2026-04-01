@@ -601,12 +601,12 @@ class ErlcSessionBot(commands.Bot):
         @self.tree.command(name="ssu", description="Start an ERLC session announcement.")
         @app_commands.guild_only()
         @app_commands.describe(
-            count="Optional vote goal players need to reach by clicking the button",
+            count="Vote goal players need to reach by clicking the button",
             ping="Optional ping: @everyone, @here, role mention, or role ID",
         )
         async def ssu(
             interaction: discord.Interaction,
-            count: Optional[int] = None,
+            count: int,
             ping: Optional[str] = None,
         ) -> None:
             if not await self.ensure_access(interaction):
@@ -643,34 +643,19 @@ class ErlcSessionBot(commands.Bot):
                 await self.send_ephemeral(interaction, ping_error)
                 return
 
-            starts_immediately = (count or 0) <= 0
-            player_count: Optional[int] = None
-            player_count_updated_at: Optional[str] = None
-
-            if starts_immediately:
-                try:
-                    player_count = await self.fetch_erlc_player_count()
-                    player_count_updated_at = utc_now_iso()
-                except Exception as error:
-                    await self.send_ephemeral(
-                        interaction,
-                        f"Could not fetch the ERLC player count: {summarize_exception(error)}",
-                    )
-                    return
-
             session = {
                 "channel_id": int(target_channel.id),
                 "message_id": None,
                 "started_by_id": str(interaction.user.id),
                 "started_by_tag": str(interaction.user),
-                "status": "active" if starts_immediately else "pending",
+                "status": "pending",
                 "created_at": utc_now_iso(),
-                "started_at": utc_now_iso() if starts_immediately else None,
-                "required_vote_count": count or 0,
+                "started_at": None,
+                "required_vote_count": count,
                 "voter_ids": [],
                 "ping_text": ping_text,
-                "player_count": player_count,
-                "player_count_updated_at": player_count_updated_at,
+                "player_count": None,
+                "player_count_updated_at": None,
             }
 
             embed = build_session_embed(
@@ -680,18 +665,10 @@ class ErlcSessionBot(commands.Bot):
             )
             try:
                 message = await target_channel.send(
-                    content=ping_text if starts_immediately else None,
+                    content=None,
                     embed=embed,
-                    view=(
-                        None
-                        if starts_immediately
-                        else SessionVoteView(self, interaction.guild.id, session)
-                    ),
-                    allowed_mentions=(
-                        allowed_mentions_for_ping(ping_text)
-                        if starts_immediately
-                        else discord.AllowedMentions.none()
-                    ),
+                    view=SessionVoteView(self, interaction.guild.id, session),
+                    allowed_mentions=discord.AllowedMentions.none(),
                 )
             except Exception as error:
                 await self.send_ephemeral(
@@ -702,22 +679,13 @@ class ErlcSessionBot(commands.Bot):
 
             session["message_id"] = message.id
             self.store.set_session(interaction.guild.id, session)
-            if starts_immediately:
-                await self.send_ephemeral(
-                    interaction,
-                    (
-                        f"Session started in {target_channel.mention}. "
-                        f"The ERLC player count will refresh every 30 seconds."
-                    ),
-                )
-            else:
-                await self.send_ephemeral(
-                    interaction,
-                    (
-                        f"Session vote started in {target_channel.mention}. "
-                        f"The session will auto-start when the vote reaches {format_vote_progress(session)}."
-                    ),
-                )
+            await self.send_ephemeral(
+                interaction,
+                (
+                    f"Session vote started in {target_channel.mention}. "
+                    f"The session will auto-start when the vote reaches {format_vote_progress(session)}."
+                ),
+            )
 
         @self.tree.command(name="ssd", description="End the active ERLC session announcement.")
         @app_commands.guild_only()
